@@ -56,6 +56,11 @@ def ensure_model_present():
 
 @app.on_event("startup")
 def load_model_and_meta():
+    # >>> Diagnóstico: permite iniciar sin modelo si se define una env var
+    if os.getenv("SKIP_MODEL_LOAD") == "1":
+        print("[startup] SKIP_MODEL_LOAD=1 -> no se carga el modelo (diagnóstico).")
+        return
+        
     global MODEL, FEATURE_ORDER, CLASSES
     try:
         MODEL = joblib.load(MODEL_PATH)
