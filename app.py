@@ -9,7 +9,7 @@ import requests, pathlib, shutil
 
 # ---------- Config ----------
 MODEL_PATH = os.getenv("MODEL_PATH", "./modelo/modelo_rf_final.pkl")
-MODEL_URL = os.getenv("sha256:e19420a7f1733b2cf3a237dfd66058eed5c8fe4d03bbb009dd2c250bbf1cb92a")
+MODEL_URL = os.getenv("MODEL URL")
 METADATA_PATH = os.getenv("METADATA_PATH", "./modelo/metadata.json")
 
 # Token opcional simple (Bearer). Si no lo configuras, no valida.
