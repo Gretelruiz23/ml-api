@@ -1,4 +1,3 @@
-   
 # app.py
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
@@ -8,12 +7,10 @@ import pandas as pd
 import requests, pathlib, shutil
 
 # ---------- Config ----------
-MODEL_PATH = os.getenv("MODEL_PATH", "./modelo/modelo_rf_final.pkl")
-MODEL_URL = os.getenv("MODEL URL")
-METADATA_PATH = os.getenv("METADATA_PATH", "./modelo/metadata.json")
-
-# Token opcional simple (Bearer). Si no lo configuras, no valida.
-API_TOKEN = os.getenv("API_TOKEN", None)
+MODEL_PATH    = os.getenv("MODEL_PATH", "modelo/modelo_rf_final.pkl")
+MODEL_URL     = os.getenv("MODEL_URL")  
+METADATA_PATH = os.getenv("METADATA_PATH", "modelo/metadata.json")  
+API_TOKEN     = os.getenv("API_TOKEN", None)  # opcional
 
 app = FastAPI(
     title="RF Prediction API",
@@ -21,7 +18,6 @@ app = FastAPI(
     description="API para servir un modelo de Random Forest (FastAPI)",
 )
 
-# Variables globales
 MODEL = None
 FEATURE_ORDER: Optional[List[str]] = None
 CLASSES: Optional[List[Any]] = None
@@ -32,56 +28,68 @@ class PredictionRequest(BaseModel):
     return_proba: bool = Field(False, description="Si True, devuelve probabilidades (si el modelo soporta)")
 
 class PredictionResponse(BaseModel):
-    # Evita el warning de 'model_' namespace
     model_config = ConfigDict(protected_namespaces=())
     predictions: List[Any]
     probabilities: Optional[List[Dict[str, float]]] = None
     model_info: Dict[str, Any]
 
-# ===== Startup: carga modelo y metadata =====
-
+# ===== Descarga segura del modelo si no existe =====
 def ensure_model_present():
     path = pathlib.Path(MODEL_PATH)
-    if path.exists():
+    if path.exists() and path.stat().st_size > 0:
+        print(f"[startup] Modelo ya existe: {path} ({path.stat().st_size/1_048_576:.1f} MB)")
         return
     if not MODEL_URL:
-        raise RuntimeError(f"Modelo no encontrado en {MODEL_PATH} y no hay MODEL_URL configurada.")
+        raise RuntimeError(f"[startup] Modelo no encontrado en {MODEL_PATH} y no hay MODEL_URL configurada.")
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    # descarga en streaming
-    with requests.get(MODEL_URL, stream=True) as r:
+    tmp = path.with_suffix(".part")
+    print(f"[startup] Descargando modelo desde: {MODEL_URL}")
+    headers = {"User-Agent": "railway-fastapi/1.0", "Accept": "*/*"}
+    with requests.get(MODEL_URL, stream=True, timeout=600, headers=headers, allow_redirects=True) as r:
         r.raise_for_status()
-        with open(path, "wb") as f:
+        with open(tmp, "wb") as f:
             shutil.copyfileobj(r.raw, f)
+    size_mb = tmp.stat().st_size / 1_048_576
+    if size_mb < 5:
+        raise RuntimeError(f"[startup] Tamaño anómalo tras descargar: {size_mb:.2f} MB (¿copiaste el link directo del asset?)")
+    tmp.replace(path)
+    print(f"[startup] Descarga OK -> {path} ({size_mb:.1f} MB)")
 
-
+# ===== Startup =====
 @app.on_event("startup")
 def load_model_and_meta():
-    # >>> Diagnóstico: permite iniciar sin modelo si se define una env var
+    # Diagnóstico opcional: saltar carga
     if os.getenv("SKIP_MODEL_LOAD") == "1":
         print("[startup] SKIP_MODEL_LOAD=1 -> no se carga el modelo (diagnóstico).")
         return
-        
+
+    # 1) Asegura modelo presente (descarga si falta)
+    ensure_model_present()
+
+    # 2) Carga modelo
     global MODEL, FEATURE_ORDER, CLASSES
     try:
+        print("[startup] Cargando modelo con joblib...")
         MODEL = joblib.load(MODEL_PATH)
+        print(f"[startup] Modelo cargado: {type(MODEL).__name__}")
     except Exception as e:
         raise RuntimeError(f"No se pudo cargar el modelo en {MODEL_PATH}: {e}")
 
-    # 1) Lee metadata.json si existe (recomendado)
+    # 3) Metadata (opcional)
     if os.path.exists(METADATA_PATH):
         try:
             with open(METADATA_PATH, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             FEATURE_ORDER = meta.get("feature_order") or FEATURE_ORDER
             CLASSES = meta.get("classes") or CLASSES
-        except Exception:
-            pass
+            print("[startup] Metadata cargada.")
+        except Exception as e:
+            print(f"[startup] Advertencia: no se pudo leer metadata: {e}")
 
-    # 2) Si no hay metadata, intenta usar nombres del modelo
+    # 4) Fallback names/clases desde el modelo
     if FEATURE_ORDER is None and hasattr(MODEL, "feature_names_in_"):
         FEATURE_ORDER = list(MODEL.feature_names_in_)
-
-    # 3) Clases del modelo (si no vinieron en metadata)
     if CLASSES is None and hasattr(MODEL, "classes_"):
         try:
             CLASSES = list(MODEL.classes_)
@@ -89,17 +97,11 @@ def load_model_and_meta():
             CLASSES = None
 
 # ===== Utilidades =====
-
 def ensure_feature_order(records: List[Dict[str, Any]]):
     if not records:
         raise HTTPException(status_code=400, detail="No se recibieron registros (records).")
-
     df = pd.DataFrame(records)
-
-    # Definir el orden esperado
     order = FEATURE_ORDER or list(df.columns)
-
-    # Validar faltantes
     faltantes = [f for f in order if f not in df.columns]
     if faltantes:
         raise HTTPException(
@@ -107,17 +109,13 @@ def ensure_feature_order(records: List[Dict[str, Any]]):
             detail=f"Faltan features requeridos: {faltantes}. "
                    f"Se esperan exactamente {len(order)} features: {order}"
         )
-
-    # Reindexa en el orden correcto; ignora columnas extra
     df = df.reindex(columns=order)
-
     return df, order
-
 
 def get_model_info():
     return {
-        "model_type": type(MODEL).__name__,
-        "supports_proba": hasattr(MODEL, "predict_proba"),
+        "model_type": (type(MODEL).__name__ if MODEL is not None else None),
+        "supports_proba": (hasattr(MODEL, "predict_proba") if MODEL is not None else None),
         "n_expected_features": (len(FEATURE_ORDER) if FEATURE_ORDER else None),
         "feature_order": FEATURE_ORDER,
         "classes": CLASSES,
@@ -130,9 +128,9 @@ def health():
 
 @app.post("/predict", response_model=PredictionResponse, tags=["inference"])
 def predict(payload: PredictionRequest):
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado.")
     df, _ = ensure_feature_order(payload.records)
-    preds = MODEL.predict(df)
-
 
     try:
         preds = MODEL.predict(df)
@@ -144,7 +142,6 @@ def predict(payload: PredictionRequest):
         if hasattr(MODEL, "predict_proba"):
             try:
                 raw = MODEL.predict_proba(df)
-                # Mapea probabilidades a nombres de clase si los tenemos
                 if CLASSES and len(CLASSES) == raw.shape[1]:
                     probas = [{str(c): float(p) for c, p in zip(CLASSES, row)} for row in raw]
                 else:
