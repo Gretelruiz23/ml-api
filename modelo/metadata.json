@@ -1,0 +1,19 @@
+{
+  "feature_order": [
+    "SEDE",
+    "ZONA",
+    "JORNADA",
+    "GRUPO",
+    "GRADO",
+    "GENERO",
+    "ASIGNATURA",
+    "CLASIFICACION_SABER11",
+    "INTERNET_COLEGIO",
+    "BIBLIOTECA",
+    "LABORATORIO_CIENCIAS_INFORMATICA",
+    "PAE",
+    "TAMANO_GRUPO",
+    "ANO"
+  ],
+  "classes": ["BAJO","BASICO","ALTO","SUPERIOR"]
+}
