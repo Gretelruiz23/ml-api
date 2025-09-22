@@ -7,9 +7,9 @@ import pandas as pd
 import numpy as np
 
 # ---------- Config ----------
-MODEL_PATH     = os.getenv("MODEL_PATH", "modelo/modelo_ganador.pkl")
-UMBRAL_PATH    = os.getenv("UMBRAL_PATH", "modelo/umbrales.pkl")
-METADATA_PATH  = os.getenv("METADATA_PATH", "modelo/metadata.json")  
+MODEL_PATH     = os.getenv("MODEL_PATH", "modelo/modelo_RandomForest_VAL_final.pkl")
+UMBRAL_PATH    = os.getenv("UMBRAL_PATH", "modelo/umbrales_RandomForest_VAL_final.pkl")
+METADATA_PATH  = os.getenv("METADATA_PATH", "modelo/metadata_modelo_valoracion.json")  
 MODEL_URL      = os.getenv("MODEL_URL")  
 API_TOKEN      = os.getenv("API_TOKEN", None)  # opcional
 
