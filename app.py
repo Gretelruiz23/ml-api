@@ -199,8 +199,22 @@ def apply_thresholds(probas: np.ndarray):
     else:
         return CLASSES[np.argmax(probas, axis=1)] if CLASSES else np.argmax(probas, axis=1)
 
+def _to_py(obj):
+    import numpy as np
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.ndarray,)):
+        return [_to_py(x) for x in obj.tolist()]
+    if isinstance(obj, (list, tuple)):
+        return [_to_py(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _to_py(v) for k, v in obj.items()}
+    return obj
+
 def get_model_info():
-    return {
+    info = {
         "model_type": (type(MODEL).__name__ if MODEL is not None else None),
         "supports_proba": (hasattr(MODEL, "predict_proba") if MODEL is not None else None),
         "n_expected_features": (len(FEATURE_ORDER) if FEATURE_ORDER else None),
@@ -208,6 +222,8 @@ def get_model_info():
         "classes": CLASSES,
         "thresholds": THRESHOLDS,
     }
+    return _to_py(info)  # <<< clave: convertir a tipos nativos
+
 
 # ===== Endpoints =====
 @app.get("/health", tags=["infra"])
@@ -239,7 +255,7 @@ def predict(payload: PredictionRequest):
 
                 # probabilidades por clase (llaves string para JSON)
                 probas = [{str(j): float(row[j]) for j in range(n_classes)} for row in raw]
-                
+
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
         else:
