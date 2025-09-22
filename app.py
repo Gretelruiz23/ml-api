@@ -24,6 +24,54 @@ FEATURE_ORDER: Optional[List[str]] = None
 CLASSES: Optional[List[Any]] = None
 THRESHOLDS: Optional[Dict[str, float]] = None
 
+
+# ======== columnas ======= 
+
+usable_cols = [
+    "periodo_1","periodo_2","periodo_3","prom_p123","std_p123","trend_p3_p1",
+    "lag1_periodo_1","lag1_periodo_2","lag1_periodo_3",
+    "lag1_prom_p123","lag1_std_p123","lag1_trend_p3_p1","lag1_nota_final",
+    "PUNTAJE_SABER11",
+    "SEDE","ZONA","JORNADA","GRUPO","TAMANO_GRUPO","GRADO","ANO","GENERO",
+    "ASIGNATURA","INTERNET_COLEGIO","BIBLIOTECA","LABORATORIO_CIENCIAS_INFORMATICA",
+    "CLASIFICACION_SABER11","PAE"
+]
+num_cols = [
+    "periodo_1","periodo_2","periodo_3","prom_p123","std_p123","trend_p3_p1",
+    "lag1_periodo_1","lag1_periodo_2","lag1_periodo_3",
+    "lag1_prom_p123","lag1_std_p123","lag1_trend_p3_p1","lag1_nota_final",
+    "PUNTAJE_SABER11"
+]
+cat_cols = [
+    "SEDE","ZONA","JORNADA","GRUPO","TAMANO_GRUPO","GRADO","ANO","GENERO",
+    "ASIGNATURA","INTERNET_COLEGIO","BIBLIOTECA","LABORATORIO_CIENCIAS_INFORMATICA",
+    "CLASIFICACION_SABER11","PAE"
+]
+
+def prepare_X_from_records(records: list) -> pd.DataFrame:
+    df = pd.DataFrame(records)
+
+    # 1) Validación: que vengan TODAS las columnas que el modelo espera
+    missing = [c for c in usable_cols if c not in df.columns]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Faltan columnas: {missing}. Se esperan {len(usable_cols)} columnas: {usable_cols}"
+        )
+
+    # 2) Tomar SOLO las columnas esperadas y en el ORDEN correcto
+    X = df[usable_cols].copy()
+
+    # 3) Tipos correctos para el pipeline
+    #    - num_cols → numérico (deja NaN si no se puede; el imputer del pipeline se encarga)
+    for c in num_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
+
+    #    - cat_cols → string (sin NaN)
+    X[cat_cols] = X[cat_cols].fillna("").astype(str)
+
+    return X
+
 # ===== Esquemas =====
 class PredictionRequest(BaseModel):
     records: List[Dict[str, Any]] = Field(..., description="Lista de observaciones {feature: valor}")
@@ -168,6 +216,11 @@ def predict(payload: PredictionRequest):
     if MODEL is None:
         raise HTTPException(status_code=503, detail="Modelo no cargado.")
     df, _ = ensure_feature_order(payload.records)
+
+    # Forzar tipos correctos para el ColumnTransformer
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")  # numéricas
+    df[cat_cols] = df[cat_cols].astype(str).fillna("")                # categóricas como string
+
 
     probas = None
     preds = None
