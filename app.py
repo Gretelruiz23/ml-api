@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, ConfigDict
 import os, json, pathlib, shutil, requests, pickle, joblib
 import pandas as pd
 import numpy as np
+from typing import List
 
 # ---------- Config ----------
 MODEL_PATH     = os.getenv("MODEL_PATH", "modelo/modelo_RandomForest_VAL_final.pkl")
@@ -79,7 +80,7 @@ class PredictionRequest(BaseModel):
 
 class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
-    predictions: List[Any]
+    predictions: List[int]
     probabilities: Optional[List[Dict[str, float]]] = None
     model_info: Dict[str, Any]
 
@@ -215,35 +216,40 @@ def health():
 def predict(payload: PredictionRequest):
     if MODEL is None:
         raise HTTPException(status_code=503, detail="Modelo no cargado.")
+
     df, _ = ensure_feature_order(payload.records)
 
-    # Forzar tipos correctos para el ColumnTransformer
-    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")  # numéricas
-    df[cat_cols] = df[cat_cols].astype(str).fillna("")                # categóricas como string
-
+    # Tipos correctos para el ColumnTransformer
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")  # numéricas → número
+    df[cat_cols] = df[cat_cols].astype(str).fillna("")                 # categóricas → string
 
     probas = None
-    preds = None
+    preds: List[int]
 
     if payload.return_proba:
         if hasattr(MODEL, "predict_proba"):
             try:
                 raw = MODEL.predict_proba(df)  # ndarray [n_samples, n_classes]
-                # Clases numéricas del modelo (e.g., [0,1,2,3])
                 classes = getattr(MODEL, "classes_", np.arange(raw.shape[1]))
-                
-                # Predicción como etiqueta numérica (no texto)
-                preds = MODEL.predict(df).tolist()
-                
-                # Probabilidades mapeadas por clase (keys string por JSON)
-                probas = [ {str(int(classes[j])): float(row[j]) for j in range(len(classes))} for row in raw]
-                
+                # predicciones numéricas
+                preds = [int(p) for p in MODEL.predict(df)]
+                # probabilidades por clase (llaves string para JSON)
+                probas = [
+                    {str(int(classes[j])): float(row[j]) for j in range(len(classes))}
+                    for row in raw
+                ]
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
         else:
             raise HTTPException(status_code=400, detail="El modelo no soporta probabilidades.")
     else:
         try:
-            preds = MODEL.predict(df)
+            preds = [int(p) for p in MODEL.predict(df)]
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error en predict: {e}")
+
+    return PredictionResponse(
+        predictions=preds,
+        probabilities=probas,
+        model_info=get_model_info(),
+    )
