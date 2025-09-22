@@ -49,6 +49,8 @@ cat_cols = [
     "CLASIFICACION_SABER11","PAE"
 ]
 
+FEATURE_ORDER = usable_cols
+
 def prepare_X_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
 
@@ -230,14 +232,14 @@ def predict(payload: PredictionRequest):
         if hasattr(MODEL, "predict_proba"):
             try:
                 raw = MODEL.predict_proba(df)  # ndarray [n_samples, n_classes]
-                classes = getattr(MODEL, "classes_", np.arange(raw.shape[1]))
+                n_classes = raw.shape[1]
+                
                 # predicciones numéricas
-                preds = [int(p) for p in MODEL.predict(df)]
+                preds = [int(np.argmax(row)) for row in raw]
+
                 # probabilidades por clase (llaves string para JSON)
-                probas = [
-                    {str(int(classes[j])): float(row[j]) for j in range(len(classes))}
-                    for row in raw
-                ]
+                probas = [{str(j): float(row[j]) for j in range(n_classes)} for row in raw]
+                
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
         else:
