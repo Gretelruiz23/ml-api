@@ -228,9 +228,16 @@ def predict(payload: PredictionRequest):
     if payload.return_proba:
         if hasattr(MODEL, "predict_proba"):
             try:
-                raw = MODEL.predict_proba(df)
-                probas = [{str(c): float(p) for c, p in zip(CLASSES, row)} for row in raw] if CLASSES else raw.tolist()
-                preds = apply_thresholds(raw)
+                raw = MODEL.predict_proba(df)  # ndarray [n_samples, n_classes]
+                # Clases numéricas del modelo (e.g., [0,1,2,3])
+                classes = getattr(MODEL, "classes_", np.arange(raw.shape[1]))
+                
+                # Predicción como etiqueta numérica (no texto)
+                preds = MODEL.predict(df).tolist()
+                
+                # Probabilidades mapeadas por clase (keys string por JSON)
+                probas = [ {str(int(classes[j])): float(row[j]) for j in range(len(classes))} for row in raw]
+                
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
         else:
@@ -240,9 +247,3 @@ def predict(payload: PredictionRequest):
             preds = MODEL.predict(df)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Error en predict: {e}")
-
-    return PredictionResponse(
-        predictions=[(p.tolist() if hasattr(p, "tolist") else p) for p in preds],
-        probabilities=probas,
-        model_info=get_model_info(),
-    )
