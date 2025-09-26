@@ -99,7 +99,6 @@ def _get_transformed_feature_names(preproc: ColumnTransformer):
                    (sirve para sumar contribuciones de one-hot al feature base)
     Soporta casos donde el CT fue entrenado con índices (sin nombres).
     """
-    import numpy as np
 
     def to_in_features(cols):
         # Normaliza la lista de columnas de entrada a strings legibles
@@ -162,6 +161,27 @@ def _get_transformed_feature_names(preproc: ColumnTransformer):
             group_of.append(base)
 
     return names_out, group_of
+
+
+def _split_pre_and_rf(model):
+    """Devuelve (pre, rf) donde pre es un Pipeline con todas las etapas previas
+    al RandomForest y rf es el RandomForestClassifier final."""
+    if not isinstance(model, Pipeline):
+        raise HTTPException(status_code=400, detail="El modelo cargado no es un Pipeline; no se puede explicar.")
+    rf_idx = None
+    for i, (name, step) in enumerate(model.steps):
+        if isinstance(step, RandomForestClassifier):
+            rf_idx = i
+            break
+    if rf_idx is None:
+        raise HTTPException(status_code=400, detail="No se encontró RandomForestClassifier dentro del Pipeline.")
+    if rf_idx == 0:
+        raise HTTPException(status_code=400, detail="No hay etapas de preprocesamiento antes del RandomForest.")
+    pre = Pipeline(steps=model.steps[:rf_idx])  # reutiliza los objetos ya ajustados
+    rf  = model.steps[rf_idx][1]
+    return pre, rf
+
+
 
 
 # ===== Esquemas =====
@@ -370,18 +390,32 @@ def explain(payload: PredictionRequest, top_k: int = 6):
     if not HAS_TI:
         raise HTTPException(status_code=503, detail="treeinterpreter no instalado. Agrega 'treeinterpreter' a requirements.txt.")
 
+    # 1) orden/tipos como en /predict
     df, _ = ensure_feature_order(payload.records)
     df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
     df[cat_cols] = df[cat_cols].astype(str).fillna("")
 
-    preproc = _find_preprocessor(MODEL)
-    rf = _find_estimator(MODEL, RandomForestClassifier)
-    if preproc is None or rf is None:
-        raise HTTPException(status_code=400, detail="No se encontró ColumnTransformer y/o RandomForest en el modelo.")
+    # 2) PARTIR EL PIPELINE REAL: pre + rf
+    pre, rf = _split_pre_and_rf(MODEL)
 
-    X = preproc.transform(df)
-    _, group_of = _get_transformed_feature_names(preproc)
+    # 3) transformar con EL MISMO preprocesamiento que usó el modelo al entrenarse
+    X = pre.transform(df)  # <- ya es todo numérico (o sparse)
 
+    # 4) intentar recuperar el ColumnTransformer dentro de 'pre' (para mapear a columnas base)
+    ct = _find_preprocessor(pre)
+    if ct is not None:
+        _, group_of = _get_transformed_feature_names(ct)
+    else:
+        # fallback: sin nombres, mapea por índice a FEATURE_ORDER si existe
+        n_out = X.shape[1]
+        group_of = []
+        for i in range(n_out):
+            if FEATURE_ORDER and i < len(FEATURE_ORDER):
+                group_of.append(str(FEATURE_ORDER[i]))
+            else:
+                group_of.append(f"f{i}")  # genérico
+
+    # 5) predicción y contribuciones locales
     proba = rf.predict_proba(X)
     _, bias, contribs = ti.predict(rf, X)
     classes = getattr(rf, "classes_", np.arange(proba.shape[1]))
@@ -389,14 +423,15 @@ def explain(payload: PredictionRequest, top_k: int = 6):
     items: List[ExplainItem] = []
     for i in range(X.shape[0]):
         cls_idx = int(np.argmax(proba[i]))
-        contrib_vec = contribs[i, :, cls_idx]
+        contrib_vec = contribs[i, :, cls_idx]  # long = n_features_transformed
 
+        # sumamos contribuciones de one-hot a la columna base
         agg: Dict[str, float] = {}
-        val_sample: Dict[str, Any] = {}
         for j, g in enumerate(group_of):
             agg[g] = agg.get(g, 0.0) + float(contrib_vec[j])
-        for col in df.columns:
-            val_sample[col] = df.iloc[i][col]
+
+        # valores originales (antes de preprocesar), para mostrar junto al driver
+        val_sample: Dict[str, Any] = {col: df.iloc[i][col] for col in df.columns}
 
         top = sorted(agg.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
         top_list: List[TopFeature] = [
