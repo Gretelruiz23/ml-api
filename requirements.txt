@@ -7,3 +7,4 @@ python-multipart==0.0.9         # si luego aceptas archivos
 pandas==2.2.2
 imbalanced-learn==0.12.3
 requests==2.32.3
+treeinterpreter==0.2.3

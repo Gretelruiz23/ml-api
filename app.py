@@ -3,6 +3,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
 import os, json, pathlib, shutil, requests, pickle, joblib
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 import pandas as pd
 import numpy as np
 from typing import List
@@ -10,8 +13,8 @@ from typing import List
 # ---------- Config ----------
 MODEL_PATH     = os.getenv("MODEL_PATH", "modelo/modelo_RandomForest_VAL_final.pkl")
 UMBRAL_PATH    = os.getenv("UMBRAL_PATH", "modelo/umbrales_RandomForest_VAL_final.pkl")
-METADATA_PATH  = os.getenv("METADATA_PATH", "modelo/metadata_modelo_valoracion.json")  
-MODEL_URL      = os.getenv("MODEL_URL")  
+METADATA_PATH  = os.getenv("METADATA_PATH", "modelo/metadata_modelo_valoracion.json")
+MODEL_URL      = os.getenv("MODEL_URL")
 API_TOKEN      = os.getenv("API_TOKEN", None)  # opcional
 
 app = FastAPI(
@@ -25,9 +28,7 @@ FEATURE_ORDER: Optional[List[str]] = None
 CLASSES: Optional[List[Any]] = None
 THRESHOLDS: Optional[Dict[str, float]] = None
 
-
-# ======== columnas ======= 
-
+# ======== columnas =======
 usable_cols = [
     "periodo_1","periodo_2","periodo_3","prom_p123","std_p123","trend_p3_p1",
     "lag1_periodo_1","lag1_periodo_2","lag1_periodo_3",
@@ -53,27 +54,57 @@ FEATURE_ORDER = usable_cols
 
 def prepare_X_from_records(records: list) -> pd.DataFrame:
     df = pd.DataFrame(records)
-
-    # 1) Validación: que vengan TODAS las columnas que el modelo espera
     missing = [c for c in usable_cols if c not in df.columns]
     if missing:
         raise HTTPException(
             status_code=400,
             detail=f"Faltan columnas: {missing}. Se esperan {len(usable_cols)} columnas: {usable_cols}"
         )
-
-    # 2) Tomar SOLO las columnas esperadas y en el ORDEN correcto
     X = df[usable_cols].copy()
-
-    # 3) Tipos correctos para el pipeline
-    #    - num_cols → numérico (deja NaN si no se puede; el imputer del pipeline se encarga)
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce")
-
-    #    - cat_cols → string (sin NaN)
     X[cat_cols] = X[cat_cols].fillna("").astype(str)
-
     return X
+
+# --- EXPLAIN: imports y helpers ---
+try:
+    from treeinterpreter import treeinterpreter as ti
+    HAS_TI = True
+except Exception:
+    HAS_TI = False
+
+def _find_estimator(obj, cls):
+    if isinstance(obj, cls):
+        return obj
+    if isinstance(obj, Pipeline):
+        for _, step in obj.steps:
+            found = _find_estimator(step, cls)
+            if found is not None:
+                return found
+    if isinstance(obj, ColumnTransformer):
+        for _, trans, _ in getattr(obj, "transformers_", []):
+            found = _find_estimator(trans, cls)
+            if found is not None:
+                return found
+    return None
+
+def _find_preprocessor(obj):
+    return _find_estimator(obj, ColumnTransformer)
+
+def _get_transformed_feature_names(preproc: ColumnTransformer):
+    names_out, group_of = [], []
+    for name, trans, cols in preproc.transformers_:
+        if name == "remainder":
+            continue
+        try:
+            fns = list(trans.get_feature_names_out(cols))
+        except Exception:
+            fns = list(cols)
+        for fn in fns:
+            base = fn.rsplit("_", 1)[0] if "_" in fn else fn
+            names_out.append(str(fn))
+            group_of.append(str(base))
+    return names_out, group_of
 
 # ===== Esquemas =====
 class PredictionRequest(BaseModel):
@@ -84,6 +115,22 @@ class PredictionResponse(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     predictions: List[int]
     probabilities: Optional[List[Dict[str, float]]] = None
+    model_info: Dict[str, Any]
+
+# --- EXPLAIN: esquemas de respuesta ---
+class TopFeature(BaseModel):
+    feature: str
+    contrib: float
+    valor: Optional[Any] = None
+
+class ExplainItem(BaseModel):
+    prediccion: int
+    probabilidades: Optional[Dict[str, float]] = None
+    top_features: List[TopFeature]
+    rules: Optional[List[str]] = None  # opcional
+
+class ExplainResponse(BaseModel):
+    items: List[ExplainItem]
     model_info: Dict[str, Any]
 
 # ===== Descarga segura del modelo si no existe =====
@@ -114,15 +161,12 @@ def ensure_model_present():
 def load_model_and_meta():
     global MODEL, FEATURE_ORDER, CLASSES, THRESHOLDS
 
-    # Diagnóstico opcional: saltar carga
     if os.getenv("SKIP_MODEL_LOAD") == "1":
         print("[startup] SKIP_MODEL_LOAD=1 -> no se carga el modelo (diagnóstico).")
         return
 
-    # 1) Asegura modelo presente
     ensure_model_present()
 
-    # 2) Carga modelo
     try:
         print("[startup] Intentando cargar modelo con joblib...")
         MODEL = joblib.load(MODEL_PATH)
@@ -136,7 +180,6 @@ def load_model_and_meta():
         except Exception as e2:
             raise RuntimeError(f"No se pudo cargar el modelo ({MODEL_PATH}). joblib error={e1}, pickle error={e2}")
 
-    # 3) Metadata
     if os.path.exists(METADATA_PATH):
         try:
             with open(METADATA_PATH, "r", encoding="utf-8") as f:
@@ -147,7 +190,6 @@ def load_model_and_meta():
         except Exception as e:
             print(f"[startup] Advertencia: no se pudo leer metadata: {e}")
 
-    # 4) Fallback names/clases desde el modelo
     if FEATURE_ORDER is None and hasattr(MODEL, "feature_names_in_"):
         FEATURE_ORDER = list(MODEL.feature_names_in_)
     if CLASSES is None and hasattr(MODEL, "classes_"):
@@ -156,7 +198,6 @@ def load_model_and_meta():
         except Exception:
             CLASSES = None
 
-    # 5) Carga umbrales
     if os.path.exists(UMBRAL_PATH):
         try:
             with open(UMBRAL_PATH, "rb") as f:
@@ -182,8 +223,7 @@ def ensure_feature_order(records: List[Dict[str, Any]]):
     return df, order
 
 def apply_thresholds(probas: np.ndarray):
-    """Aplica umbrales personalizados si están definidos."""
-    if THRESHOLDS and CLASSES:
+    if THRESHOLDS and CLASSES is not None:
         preds = []
         for row in probas:
             row_dict = {str(c): float(p) for c, p in zip(CLASSES, row)}
@@ -193,7 +233,7 @@ def apply_thresholds(probas: np.ndarray):
                     chosen = c
                     break
             if chosen is None:
-                chosen = CLASSES[np.argmax(row)]  # fallback
+                chosen = CLASSES[np.argmax(row)]
             preds.append(chosen)
         return preds
     else:
@@ -222,8 +262,7 @@ def get_model_info():
         "classes": CLASSES,
         "thresholds": THRESHOLDS,
     }
-    return _to_py(info)  # <<< clave: convertir a tipos nativos
-
+    return _to_py(info)
 
 # ===== Endpoints =====
 @app.get("/health", tags=["infra"])
@@ -236,10 +275,8 @@ def predict(payload: PredictionRequest):
         raise HTTPException(status_code=503, detail="Modelo no cargado.")
 
     df, _ = ensure_feature_order(payload.records)
-
-    # Tipos correctos para el ColumnTransformer
-    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")  # numéricas → número
-    df[cat_cols] = df[cat_cols].astype(str).fillna("")                 # categóricas → string
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+    df[cat_cols] = df[cat_cols].astype(str).fillna("")
 
     probas = None
     preds: List[int]
@@ -249,13 +286,8 @@ def predict(payload: PredictionRequest):
             try:
                 raw = MODEL.predict_proba(df)  # ndarray [n_samples, n_classes]
                 n_classes = raw.shape[1]
-                
-                # predicciones numéricas
                 preds = [int(np.argmax(row)) for row in raw]
-
-                # probabilidades por clase (llaves string para JSON)
                 probas = [{str(j): float(row[j]) for j in range(n_classes)} for row in raw]
-
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
         else:
@@ -270,4 +302,59 @@ def predict(payload: PredictionRequest):
         predictions=preds,
         probabilities=probas,
         model_info=get_model_info(),
+    )
+
+# --- EXPLAIN: endpoint /explain ---
+@app.post("/explain", response_model=ExplainResponse, tags=["inference"])
+def explain(payload: PredictionRequest, top_k: int = 6):
+    if MODEL is None:
+        raise HTTPException(status_code=503, detail="Modelo no cargado.")
+    if not HAS_TI:
+        raise HTTPException(status_code=503, detail="treeinterpreter no instalado. Agrega 'treeinterpreter' a requirements.txt.")
+
+    df, _ = ensure_feature_order(payload.records)
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+    df[cat_cols] = df[cat_cols].astype(str).fillna("")
+
+    preproc = _find_preprocessor(MODEL)
+    rf = _find_estimator(MODEL, RandomForestClassifier)
+    if preproc is None or rf is None:
+        raise HTTPException(status_code=400, detail="No se encontró ColumnTransformer y/o RandomForest en el modelo.")
+
+    X = preproc.transform(df)
+    _, group_of = _get_transformed_feature_names(preproc)
+
+    proba = rf.predict_proba(X)
+    _, bias, contribs = ti.predict(rf, X)
+    classes = getattr(rf, "classes_", np.arange(proba.shape[1]))
+
+    items: List[ExplainItem] = []
+    for i in range(X.shape[0]):
+        cls_idx = int(np.argmax(proba[i]))
+        contrib_vec = contribs[i, :, cls_idx]
+
+        agg: Dict[str, float] = {}
+        val_sample: Dict[str, Any] = {}
+        for j, g in enumerate(group_of):
+            agg[g] = agg.get(g, 0.0) + float(contrib_vec[j])
+        for col in df.columns:
+            val_sample[col] = df.iloc[i][col]
+
+        top = sorted(agg.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_k]
+        top_list: List[TopFeature] = [
+            TopFeature(feature=k, contrib=float(v), valor=_to_py(val_sample.get(k, None)) if k in df.columns else None)
+            for k, v in top
+        ]
+
+        item = ExplainItem(
+            prediccion=int(classes[cls_idx]) if hasattr(classes[cls_idx], "__int__") else int(cls_idx),
+            probabilidades={str(int(classes[j])): float(proba[i, j]) for j in range(len(classes))},
+            top_features=top_list,
+            rules=None
+        )
+        items.append(item)
+
+    return ExplainResponse(
+        items=items,
+        model_info=get_model_info()
     )
