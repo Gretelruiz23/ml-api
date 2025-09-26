@@ -8,7 +8,6 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 import pandas as pd
 import numpy as np
-from typing import List
 
 # ---------- Config ----------
 MODEL_PATH     = os.getenv("MODEL_PATH", "modelo/modelo_RandomForest_VAL_final.pkl")
@@ -74,14 +73,16 @@ except Exception:
     HAS_TI = False
 
 def _find_estimator(obj, cls):
+    """Busca recursivamente un objeto del tipo cls dentro de Pipelines/ColumnTransformers."""
     if isinstance(obj, cls):
         return obj
-    if isinstance(obj, Pipeline):
-        for _, step in obj.steps:
+    steps = getattr(obj, "steps", None)
+    if steps:
+        for _, step in steps:
             found = _find_estimator(step, cls)
             if found is not None:
                 return found
-    if isinstance(obj, ColumnTransformer):
+    if isinstance(obj, ColumnTransformer) or obj.__class__.__name__ == "ColumnTransformer":
         for _, trans, _ in getattr(obj, "transformers_", []):
             found = _find_estimator(trans, cls)
             if found is not None:
@@ -99,20 +100,16 @@ def _get_transformed_feature_names(preproc: ColumnTransformer):
                    (sirve para sumar contribuciones de one-hot al feature base)
     Soporta casos donde el CT fue entrenado con índices (sin nombres).
     """
-
     def to_in_features(cols):
-        # Normaliza la lista de columnas de entrada a strings legibles
         if isinstance(cols, slice):
             idxs = list(range(cols.start or 0, cols.stop, cols.step or 1))
         elif isinstance(cols, (list, tuple, np.ndarray)):
             idxs = list(cols)
         else:
             idxs = [cols]
-
         feats = []
         for c in idxs:
             if isinstance(c, (int, np.integer)):
-                # Mapea índice → nombre usando FEATURE_ORDER si existe
                 if FEATURE_ORDER and 0 <= int(c) < len(FEATURE_ORDER):
                     feats.append(str(FEATURE_ORDER[int(c)]))
                 else:
@@ -128,48 +125,45 @@ def _get_transformed_feature_names(preproc: ColumnTransformer):
             continue
 
         fns = None
-        # Intento 1: pedir nombres al transformer (Pipeline/OneHotEncoder modernos lo soportan)
         try:
             in_features = to_in_features(cols)
-            fns = list(trans.get_feature_names_out(in_features))  # puede fallar
+            # muchos transformadores modernos soportan esto; Pipeline puede fallar
+            fns = list(trans.get_feature_names_out(in_features))
         except Exception:
             fns = None
 
-        # Intento 2: fallback: una salida por cada columna de entrada (sin expansión)
         if fns is None:
             in_features = to_in_features(cols)
-            fns = in_features[:]  # sin expansión (imputer/escalares, etc.)
+            # Fallback SIN expansión (imputer/escalers). OJO: puede ser menor que X.shape[1]
+            fns = in_features[:]
 
-        # Mapear cada nombre de salida al "feature base" (col original)
         for fn in fns:
             s = str(fn)
-
-            # Heurística para one-hot: si empieza por alguna cat_col + "_"
             base = None
             for col in sorted(cat_cols, key=len, reverse=True):
                 if s.startswith(col + "_"):
                     base = col
                     break
-
-            # Si no calza con cat_cols, usa s tal cual. Si ese s coincide con alguna
-            # col original, perfecto; si no, lo dejamos como s.
             if base is None:
-                # Si s era un índice mapeado a FEATURE_ORDER ya quedó como nombre.
                 base = s
-
             names_out.append(s)
             group_of.append(base)
 
     return names_out, group_of
 
-
 def _split_pre_and_rf(model):
-    """Devuelve (pre, rf) donde pre es un Pipeline con todas las etapas previas
-    al RandomForest y rf es el RandomForestClassifier final."""
-    if not isinstance(model, Pipeline):
-        raise HTTPException(status_code=400, detail="El modelo cargado no es un Pipeline; no se puede explicar.")
+    """
+    Devuelve (pre, rf) donde:
+      - pre: pipeline/transformador con SOLO etapas que tengan .transform (se saltan resamplers tipo SMOTE/SMOTENC)
+      - rf : RandomForestClassifier final
+    No depende de la clase exacta del pipeline (sklearn/imblearn).
+    """
+    steps = getattr(model, "steps", None)
+    if not steps:
+        raise HTTPException(status_code=400, detail="El modelo cargado no es un Pipeline o no expone 'steps'.")
+
     rf_idx = None
-    for i, (name, step) in enumerate(model.steps):
+    for i, (name, step) in enumerate(steps):
         if isinstance(step, RandomForestClassifier):
             rf_idx = i
             break
@@ -177,12 +171,25 @@ def _split_pre_and_rf(model):
         raise HTTPException(status_code=400, detail="No se encontró RandomForestClassifier dentro del Pipeline.")
     if rf_idx == 0:
         raise HTTPException(status_code=400, detail="No hay etapas de preprocesamiento antes del RandomForest.")
-    pre = Pipeline(steps=model.steps[:rf_idx])  # reutiliza los objetos ya ajustados
-    rf  = model.steps[rf_idx][1]
+
+    pre_steps = []
+    for name, step in steps[:rf_idx]:
+        if hasattr(step, "transform"):
+            pre_steps.append((name, step))
+        else:
+            # resamplers (SMOTE/SMOTENC/etc.) carecen de .transform; se saltan en inferencia
+            pass
+
+    if not pre_steps:
+        ct = _find_preprocessor(model)
+        if ct is None:
+            raise HTTPException(status_code=400, detail="No hay preprocesador con 'transform' antes del RF.")
+        pre = ct
+    else:
+        pre = Pipeline(steps=pre_steps)
+
+    rf = steps[rf_idx][1]
     return pre, rf
-
-
-
 
 # ===== Esquemas =====
 class PredictionRequest(BaseModel):
@@ -195,7 +202,6 @@ class PredictionResponse(BaseModel):
     probabilities: Optional[List[Dict[str, float]]] = None
     model_info: Dict[str, Any]
 
-# --- EXPLAIN: esquemas de respuesta ---
 class TopFeature(BaseModel):
     feature: str
     contrib: float
@@ -399,31 +405,32 @@ def explain(payload: PredictionRequest, top_k: int = 6):
     pre, rf = _split_pre_and_rf(MODEL)
 
     # 3) transformar con EL MISMO preprocesamiento que usó el modelo al entrenarse
-    X = pre.transform(df)  # <- ya es todo numérico (o sparse)
+    X = pre.transform(df)  # puede ser sparse
+    X_ti = X.toarray() if hasattr(X, "toarray") else np.asarray(X)  # densificar para treeinterpreter/RF
 
     # 4) intentar recuperar el ColumnTransformer dentro de 'pre' (para mapear a columnas base)
     ct = _find_preprocessor(pre)
     if ct is not None:
         _, group_of = _get_transformed_feature_names(ct)
     else:
-        # fallback: sin nombres, mapea por índice a FEATURE_ORDER si existe
-        n_out = X.shape[1]
-        group_of = []
-        for i in range(n_out):
-            if FEATURE_ORDER and i < len(FEATURE_ORDER):
-                group_of.append(str(FEATURE_ORDER[i]))
-            else:
-                group_of.append(f"f{i}")  # genérico
+        n_out = X_ti.shape[1]
+        group_of = [str(FEATURE_ORDER[i]) if FEATURE_ORDER and i < len(FEATURE_ORDER) else f"f{i}" for i in range(n_out)]
+
+    # Ajustar longitud por seguridad (evita IndexError si faltan nombres)
+    if len(group_of) < X_ti.shape[1]:
+        group_of += [f"f{j}" for j in range(len(group_of), X_ti.shape[1])]
+    elif len(group_of) > X_ti.shape[1]:
+        group_of = group_of[:X_ti.shape[1]]
 
     # 5) predicción y contribuciones locales
-    proba = rf.predict_proba(X)
-    _, bias, contribs = ti.predict(rf, X)
+    proba = rf.predict_proba(X_ti)
+    _, bias, contribs = ti.predict(rf, X_ti)
     classes = getattr(rf, "classes_", np.arange(proba.shape[1]))
 
     items: List[ExplainItem] = []
-    for i in range(X.shape[0]):
+    for i in range(X_ti.shape[0]):
         cls_idx = int(np.argmax(proba[i]))
-        contrib_vec = contribs[i, :, cls_idx]  # long = n_features_transformed
+        contrib_vec = contribs[i, :, cls_idx]  # n_features_transformed
 
         # sumamos contribuciones de one-hot a la columna base
         agg: Dict[str, float] = {}
@@ -439,13 +446,12 @@ def explain(payload: PredictionRequest, top_k: int = 6):
             for k, v in top
         ]
 
-        item = ExplainItem(
+        items.append(ExplainItem(
             prediccion=int(classes[cls_idx]) if hasattr(classes[cls_idx], "__int__") else int(cls_idx),
             probabilidades={str(int(classes[j])): float(proba[i, j]) for j in range(len(classes))},
             top_features=top_list,
             rules=None
-        )
-        items.append(item)
+        ))
 
     return ExplainResponse(
         items=items,
