@@ -92,19 +92,77 @@ def _find_preprocessor(obj):
     return _find_estimator(obj, ColumnTransformer)
 
 def _get_transformed_feature_names(preproc: ColumnTransformer):
+    """
+    Devuelve:
+      - names_out: nombres de columnas transformadas (strings)
+      - group_of : por cada col transformada, el nombre de la columna ORIGINAL
+                   (sirve para sumar contribuciones de one-hot al feature base)
+    Soporta casos donde el CT fue entrenado con índices (sin nombres).
+    """
+    import numpy as np
+
+    def to_in_features(cols):
+        # Normaliza la lista de columnas de entrada a strings legibles
+        if isinstance(cols, slice):
+            idxs = list(range(cols.start or 0, cols.stop, cols.step or 1))
+        elif isinstance(cols, (list, tuple, np.ndarray)):
+            idxs = list(cols)
+        else:
+            idxs = [cols]
+
+        feats = []
+        for c in idxs:
+            if isinstance(c, (int, np.integer)):
+                # Mapea índice → nombre usando FEATURE_ORDER si existe
+                if FEATURE_ORDER and 0 <= int(c) < len(FEATURE_ORDER):
+                    feats.append(str(FEATURE_ORDER[int(c)]))
+                else:
+                    feats.append(str(c))
+            else:
+                feats.append(str(c))
+        return feats
+
     names_out, group_of = [], []
+
     for name, trans, cols in preproc.transformers_:
         if name == "remainder":
             continue
+
+        fns = None
+        # Intento 1: pedir nombres al transformer (Pipeline/OneHotEncoder modernos lo soportan)
         try:
-            fns = list(trans.get_feature_names_out(cols))
+            in_features = to_in_features(cols)
+            fns = list(trans.get_feature_names_out(in_features))  # puede fallar
         except Exception:
-            fns = list(cols)
+            fns = None
+
+        # Intento 2: fallback: una salida por cada columna de entrada (sin expansión)
+        if fns is None:
+            in_features = to_in_features(cols)
+            fns = in_features[:]  # sin expansión (imputer/escalares, etc.)
+
+        # Mapear cada nombre de salida al "feature base" (col original)
         for fn in fns:
-            base = fn.rsplit("_", 1)[0] if "_" in fn else fn
-            names_out.append(str(fn))
-            group_of.append(str(base))
+            s = str(fn)
+
+            # Heurística para one-hot: si empieza por alguna cat_col + "_"
+            base = None
+            for col in sorted(cat_cols, key=len, reverse=True):
+                if s.startswith(col + "_"):
+                    base = col
+                    break
+
+            # Si no calza con cat_cols, usa s tal cual. Si ese s coincide con alguna
+            # col original, perfecto; si no, lo dejamos como s.
+            if base is None:
+                # Si s era un índice mapeado a FEATURE_ORDER ya quedó como nombre.
+                base = s
+
+            names_out.append(s)
+            group_of.append(base)
+
     return names_out, group_of
+
 
 # ===== Esquemas =====
 class PredictionRequest(BaseModel):
