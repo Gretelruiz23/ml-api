@@ -29,18 +29,24 @@ THRESHOLDS: Optional[Dict[str, float]] = None
 
 # ======== columnas =======
 usable_cols = [
-    "periodo_1","periodo_2","periodo_3","prom_p123","std_p123","trend_p3_p1",
-    "lag1_periodo_1","lag1_periodo_2","lag1_periodo_3",
-    "lag1_prom_p123","lag1_std_p123","lag1_trend_p3_p1","lag1_nota_final",
+    "lag1_periodo_1",
+    "lag1_periodo_2",
+    "lag1_periodo_3",
+    "lag1_prom_p123",
+    "lag1_std_p123",
+    "lag1_trend_p3_p1",
     "PUNTAJE_SABER11",
     "SEDE","ZONA","JORNADA","GRUPO","TAMANO_GRUPO","GRADO","ANO","GENERO",
     "ASIGNATURA","INTERNET_COLEGIO","BIBLIOTECA","LABORATORIO_CIENCIAS_INFORMATICA",
     "CLASIFICACION_SABER11","PAE"
 ]
 num_cols = [
-    "periodo_1","periodo_2","periodo_3","prom_p123","std_p123","trend_p3_p1",
-    "lag1_periodo_1","lag1_periodo_2","lag1_periodo_3",
-    "lag1_prom_p123","lag1_std_p123","lag1_trend_p3_p1","lag1_nota_final",
+    "lag1_periodo_1",
+    "lag1_periodo_2",
+    "lag1_periodo_3",
+    "lag1_prom_p123",
+    "lag1_std_p123",
+    "lag1_trend_p3_p1",
     "PUNTAJE_SABER11"
 ]
 cat_cols = [
@@ -368,9 +374,22 @@ def predict(payload: PredictionRequest):
     if payload.return_proba:
         if hasattr(MODEL, "predict_proba"):
             try:
-                raw = MODEL.predict_proba(df)  # ndarray [n_samples, n_classes]
+                raw = MODEL.predict_proba(df)
                 n_classes = raw.shape[1]
-                preds = [int(np.argmax(row)) for row in raw]
+                # Aplicar umbrales si están disponibles
+                if THRESHOLDS is not None:
+                    preds = []
+                    for row in raw:
+                        aplicado = False
+                        for cls_idx, thr in enumerate(THRESHOLDS):
+                            if row[cls_idx] >= thr:
+                                preds.append(cls_idx)
+                                aplicado = True
+                                break
+                        if not aplicado:
+                            preds.append(int(np.argmax(row)))
+                else:
+                    preds = [int(np.argmax(row)) for row in raw]
                 probas = [{str(j): float(row[j]) for j in range(n_classes)} for row in raw]
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error en predict_proba: {e}")
