@@ -224,78 +224,57 @@ class ExplainResponse(BaseModel):
     model_info: Dict[str, Any]
 
 # ===== Descarga segura del modelo si no existe =====
-def ensure_model_present():
-    path = pathlib.Path(MODEL_PATH)
-    if path.exists() and path.stat().st_size > 0:
-        print(f"[startup] Modelo ya existe: {path} ({path.stat().st_size/1_048_576:.1f} MB)")
-        return
-    if not MODEL_URL:
-        raise RuntimeError(f"[startup] Modelo no encontrado en {MODEL_PATH} y no hay MODEL_URL configurada.")
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".part")
-    print(f"[startup] Descargando modelo desde: {MODEL_URL}")
+def download_file(url: str, dest: pathlib.Path):
+    """Descarga un archivo desde una URL hacia dest."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".part")
+    print(f"[startup] Descargando {dest.name} desde: {url}")
     headers = {"User-Agent": "fastapi-model/1.0", "Accept": "*/*"}
-    with requests.get(MODEL_URL, stream=True, timeout=600, headers=headers, allow_redirects=True) as r:
+    with requests.get(url, stream=True, timeout=600, headers=headers, allow_redirects=True) as r:
         r.raise_for_status()
         with open(tmp, "wb") as f:
             shutil.copyfileobj(r.raw, f)
     size_mb = tmp.stat().st_size / 1_048_576
-    if size_mb < 0.1:
-        raise RuntimeError(f"[startup] Tamaño anómalo tras descargar: {size_mb:.2f} MB")
-    tmp.replace(path)
-    print(f"[startup] Descarga OK -> {path} ({size_mb:.1f} MB)")
+    if size_mb < 0.001:
+        raise RuntimeError(f"[startup] Tamaño anómalo tras descargar {dest.name}: {size_mb:.4f} MB")
+    tmp.replace(dest)
+    print(f"[startup] Descarga OK -> {dest} ({size_mb:.1f} MB)")
 
-# ===== Startup =====
-@app.on_event("startup")
-def load_model_and_meta():
-    global MODEL, FEATURE_ORDER, CLASSES, THRESHOLDS
 
-    if os.getenv("SKIP_MODEL_LOAD") == "1":
-        print("[startup] SKIP_MODEL_LOAD=1 -> no se carga el modelo (diagnóstico).")
-        return
+def ensure_model_present():
+    # --- Modelo principal ---
+    model_path = pathlib.Path(MODEL_PATH)
+    if not (model_path.exists() and model_path.stat().st_size > 0):
+        if not MODEL_URL:
+            raise RuntimeError(
+                f"[startup] Modelo no encontrado en {MODEL_PATH} y no hay MODEL_URL configurada."
+            )
+        download_file(MODEL_URL, model_path)
+    else:
+        print(f"[startup] Modelo ya existe: {model_path} ({model_path.stat().st_size/1_048_576:.1f} MB)")
 
-    ensure_model_present()
+    # --- Umbrales ---
+    umbral_path = pathlib.Path(UMBRAL_PATH)
+    umbral_url  = os.getenv("UMBRAL_URL")
+    if not (umbral_path.exists() and umbral_path.stat().st_size > 0):
+        if umbral_url:
+            download_file(umbral_url, umbral_path)
+        else:
+            print("[startup] Advertencia: no hay UMBRAL_URL configurada, se continuará sin umbrales.")
+    else:
+        print(f"[startup] Umbrales ya existen: {umbral_path}")
 
-    try:
-        print("[startup] Intentando cargar modelo con joblib...")
-        MODEL = joblib.load(MODEL_PATH)
-        print(f"[startup] Modelo cargado con joblib: {type(MODEL).__name__}")
-    except Exception as e1:
-        try:
-            print("[startup] Fallback: intentando cargar modelo con pickle...")
-            with open(MODEL_PATH, "rb") as f:
-                MODEL = pickle.load(f)
-            print(f"[startup] Modelo cargado con pickle: {type(MODEL).__name__}")
-        except Exception as e2:
-            raise RuntimeError(f"No se pudo cargar el modelo ({MODEL_PATH}). joblib error={e1}, pickle error={e2}")
-
-    if os.path.exists(METADATA_PATH):
-        try:
-            with open(METADATA_PATH, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            FEATURE_ORDER = meta.get("feature_order") or FEATURE_ORDER
-            CLASSES = meta.get("classes") or CLASSES
-            print("[startup] Metadata cargada.")
-        except Exception as e:
-            print(f"[startup] Advertencia: no se pudo leer metadata: {e}")
-
-    if FEATURE_ORDER is None and hasattr(MODEL, "feature_names_in_"):
-        FEATURE_ORDER = list(MODEL.feature_names_in_)
-    if CLASSES is None and hasattr(MODEL, "classes_"):
-        try:
-            CLASSES = list(MODEL.classes_)
-        except Exception:
-            CLASSES = None
-
-    if os.path.exists(UMBRAL_PATH):
-        try:
-            with open(UMBRAL_PATH, "rb") as f:
-                THRESHOLDS = pickle.load(f)
-            print(f"[startup] Umbrales cargados: {THRESHOLDS}")
-        except Exception as e:
-            print(f"[startup] Advertencia: no se pudo cargar umbrales: {e}")
-
+    # --- Metadata ---
+    meta_path = pathlib.Path(METADATA_PATH)
+    meta_url  = os.getenv("METADATA_URL")
+    if not (meta_path.exists() and meta_path.stat().st_size > 0):
+        if meta_url:
+            download_file(meta_url, meta_path)
+        else:
+            print("[startup] Advertencia: no hay METADATA_URL configurada, se continuará sin metadata.")
+    else:
+        print(f"[startup] Metadata ya existe: {meta_path}")
+        
 # ===== Utilidades =====
 def ensure_feature_order(records: List[Dict[str, Any]]):
     if not records:
