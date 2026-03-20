@@ -274,7 +274,61 @@ def ensure_model_present():
             print("[startup] Advertencia: no hay METADATA_URL configurada, se continuará sin metadata.")
     else:
         print(f"[startup] Metadata ya existe: {meta_path}")
-        
+
+# ===== Startup =====
+@app.on_event("startup")
+async def load_model_and_meta():
+    global MODEL, FEATURE_ORDER, CLASSES, THRESHOLDS
+
+    if os.getenv("SKIP_MODEL_LOAD") == "1":
+        print("[startup] SKIP_MODEL_LOAD=1 -> no se carga el modelo.")
+        return
+
+    ensure_model_present()
+
+    try:
+        print("[startup] Intentando cargar modelo con joblib...")
+        MODEL = joblib.load(MODEL_PATH)
+        print(f"[startup] Modelo cargado con joblib: {type(MODEL).__name__}")
+    except Exception as e1:
+        try:
+            print("[startup] Fallback: intentando cargar modelo con pickle...")
+            with open(MODEL_PATH, "rb") as f:
+                MODEL = pickle.load(f)
+            print(f"[startup] Modelo cargado con pickle: {type(MODEL).__name__}")
+        except Exception as e2:
+            raise RuntimeError(
+                f"No se pudo cargar el modelo ({MODEL_PATH}). "
+                f"joblib error={e1}, pickle error={e2}"
+            )
+
+    if os.path.exists(METADATA_PATH):
+        try:
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            FEATURE_ORDER = meta.get("feature_order") or FEATURE_ORDER
+            CLASSES = meta.get("classes") or CLASSES
+            print("[startup] Metadata cargada.")
+        except Exception as e:
+            print(f"[startup] Advertencia: no se pudo leer metadata: {e}")
+
+    if FEATURE_ORDER is None and hasattr(MODEL, "feature_names_in_"):
+        FEATURE_ORDER = list(MODEL.feature_names_in_)
+    if CLASSES is None and hasattr(MODEL, "classes_"):
+        try:
+            CLASSES = list(MODEL.classes_)
+        except Exception:
+            CLASSES = None
+
+    if os.path.exists(UMBRAL_PATH):
+        try:
+            with open(UMBRAL_PATH, "rb") as f:
+                THRESHOLDS = pickle.load(f)
+            print(f"[startup] Umbrales cargados: {THRESHOLDS}")
+        except Exception as e:
+            print(f"[startup] Advertencia: no se pudo cargar umbrales: {e}")
+
+
 # ===== Utilidades =====
 def ensure_feature_order(records: List[Dict[str, Any]]):
     if not records:
