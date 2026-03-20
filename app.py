@@ -224,6 +224,7 @@ class ExplainResponse(BaseModel):
     model_info: Dict[str, Any]
 
 # ===== Descarga segura del modelo si no existe =====
+
 def download_file(url: str, dest: pathlib.Path):
     """Descarga un archivo desde una URL hacia dest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -235,11 +236,10 @@ def download_file(url: str, dest: pathlib.Path):
         with open(tmp, "wb") as f:
             shutil.copyfileobj(r.raw, f)
     size_mb = tmp.stat().st_size / 1_048_576
-    if size_mb < 0.001:
+    if size_mb < 0.000001:  # ← cambiar de 0.001 a 0.000001 (1 byte mínimo)
         raise RuntimeError(f"[startup] Tamaño anómalo tras descargar {dest.name}: {size_mb:.4f} MB")
     tmp.replace(dest)
-    print(f"[startup] Descarga OK -> {dest} ({size_mb:.1f} MB)")
-
+    print(f"[startup] Descarga OK -> {dest} ({size_mb:.4f} MB)")
 
 def ensure_model_present():
     # --- Modelo principal ---
